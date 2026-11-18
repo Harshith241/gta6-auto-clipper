@@ -1,0 +1,31 @@
+# Copy to config.yaml (gitignored) and edit.
+streamers:
+  kaicenat:
+    platform: twitch
+    facecam: { x: 1440, y: 0, w: 480, h: 270 }   # source pixels, 1920x1080 — find with `clipper calibrate`
+  default:
+    facecam: null                                 # null = full gameplay on a blurred, zoomed background
+
+weights: { chat: 1.0, audio: 0.7, clips: 1.5 }
+chat_lag_seconds: 7        # chat reacts ~5-10 s after the moment
+max_candidates: 25         # peaks sent to the judge
+min_gap_seconds: 60        # min distance between peaks
+min_score: 1.0             # min fused score for a peak (lower = more candidates)
+min_llm_score: 6           # drop anything Claude rates below this
+whisper_model: small       # tiny | base | small | medium | large-v3
+llm_model: claude-haiku-5-5
+render_workers: 3
+keywords: { KEKW: 2, LUL: 1.5, OMEGALUL: 2, LMAO: 1.5, W: 1, L: 1, "???": 1.5, "NO WAY": 2, "CLIP IT": 3,
+            CLIP: 2, WHAT: 1, HOLY: 1.5, Pog: 1.5, PogChamp: 1.5, monkaS: 1.5, "💀": 1.5, "😂": 1.5 }
+
+# With campaigns set, `run` refuses streamers that aren't in any campaign,
+# and enforces that campaign's clip length + required caption tags.
+campaigns:
+  - name: kai-gta6-whop
+    streamers: [kaicenat]
+    platforms: [tiktok, youtube, instagram]
+    required_tags: ["#ad", "@kaicenat"]
+    min_len: 15
+    max_len: 60
+    rate_per_1k: 1.0       # $ per 1,000 approved views
+    cap_per_clip: 100      # max $ per clip

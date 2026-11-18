@@ -47,6 +47,7 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
     from clipper.fuse import clip_window, fit_length, fuse, pick_peaks
     from clipper.ingest import load_chat, load_meta
     from clipper.judge import _client, generic_judgment, judge, transcribe
+    from clipper.ops import with_tags
     from clipper.signals.audio import audio_signal, loudness_db
     from clipper.signals.chat import chat_signal
     from clipper.signals.twitch_clips import twitch_clips_signal
@@ -64,7 +65,8 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
     score = fuse(chat, audio, clips, cfg.weights, n)
     peaks = pick_peaks(score, top or cfg.max_candidates, cfg.min_gap_seconds, cfg.min_score)
     console.print(f"[cyan]{n}s analysed, {len(msgs)} chat msgs, {len(peaks)} peaks")
-    min_len, max_len = 15, 60
+    camp = cfg.campaign_for(meta["streamer"])
+    min_len, max_len = (camp.min_len, camp.max_len) if camp else (15, 60)
     cands = []
     for p in peaks:
         s, e = clip_window(p, db, n, min_len=min_len, max_len=max_len)
@@ -100,6 +102,9 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
     kept.sort(key=lambda c: c["final"], reverse=True)
     for c in kept:
         c["vod_start"] = meta["offset"] + c["start"]
+        if camp:
+            c["campaign"] = camp.name
+            c["caption"] = with_tags(c["caption"], camp.required_tags)
     if use_llm:
         console.print(f"[cyan]LLM kept {len(kept)}/{len(cands)} (min score {cfg.min_llm_score})")
     (d / "candidates.json").write_text(json.dumps(kept, indent=2, ensure_ascii=False))
@@ -199,7 +204,14 @@ def run_all(
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip the Claude judge (signal ranking only)"),
 ) -> None:
     """ingest -> analyze -> render, all in one."""
+    from clipper.ingest import load_meta
+    from clipper.ops import require_campaign
+
+    cfg = load_config()
+    if streamer:
+        require_campaign(cfg, streamer)  # refuse before downloading gigabytes
     d = _ingest(url, video, chat, streamer, start, end)
+    require_campaign(cfg, load_meta(d)["streamer"])
     _analyze(d, None if not no_llm else top, not no_llm)  # LLM mode judges max_candidates, then keeps the best
     out_dir, rows = _render(d, top)
     _summary(out_dir, rows)
@@ -221,6 +233,88 @@ def calibrate(job: str = typer.Argument(..., help="Job id (data/<job>)"),
     console.print(f"[green]Frame -> {png.resolve()}  (source {w}x{h})")
     console.print("Open it, find the facecam rectangle in source pixels, then add to config.yaml:\n"
                   f"streamers:\n  {meta['streamer']}:\n    facecam: {{ x: 1440, y: 0, w: 480, h: 270 }}")
+
+
+@app.command()
+def schedule(job: str = typer.Argument(..., help="Job id with rendered clips"),
+             accounts: str = typer.Option("tiktok,youtube,instagram", help="Comma-separated platforms"),
+             start: str = typer.Option("18:00", help="First post time HH:MM"),
+             gap: str = typer.Option("45m", help="Gap between posts per platform"),
+             per_day: int = typer.Option(10, help="Max posts per platform per day"),
+             day: Optional[str] = typer.Option(None, help="YYYY-MM-DD (default today)")) -> None:
+    """Assign rendered clips to platforms + post times -> schedule.csv."""
+    import csv
+    import json
+    from datetime import date
+
+    from clipper.ingest import job_dir, load_meta
+    from clipper.ops import build_schedule
+
+    cfg = load_config()
+    meta = load_meta(job_dir(cfg, job))
+    out_dir = cfg.out_dir / meta["streamer"] / meta["job"]
+    man = out_dir / "manifest.json"
+    if not man.exists():
+        raise ClipperError(f"No rendered clips for {job}. Run `clipper render {job}` first.")
+    rows = build_schedule(json.loads(man.read_text()), cfg, [a.strip() for a in accounts.split(",") if a.strip()],
+                          start, gap, per_day, date.fromisoformat(day) if day else date.today())
+    path = out_dir / "schedule.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, ["post_at", "platform", "rank", "file", "title", "caption", "campaign", "streamer", "category"])
+        w.writeheader()
+        w.writerows(rows)
+    console.print(f"[green]{len(rows)} posts scheduled -> {path}")
+
+
+track_app = typer.Typer(no_args_is_help=True, help="Posted-clip tracker (tracker.csv).")
+app.add_typer(track_app, name="track")
+
+
+@track_app.command("add")
+def track_add_cmd(clip: Path, platform: str = typer.Option(..., help="tiktok|youtube|instagram|x"),
+                  url: str = typer.Option(..., help="Post URL"),
+                  submitted: bool = typer.Option(True, help="Link already submitted to the campaign?")) -> None:
+    """Log a posted clip."""
+    from clipper.ops import track_add
+
+    row = track_add(clip, platform, url, load_config(), submitted)
+    console.print(f"[green]Tracked {clip.name} on {platform} ({row['campaign'] or 'no campaign'})")
+
+
+@track_app.command("views")
+def track_views_cmd(url: str, views: int) -> None:
+    """Update a post's view count (recomputes estimated earnings)."""
+    from clipper.ops import track_views
+
+    row = track_views(url, views, load_config())
+    console.print(f"[green]{row['clip']}: {views} views -> ${row['earnings']}")
+
+
+@track_app.command("report")
+def track_report_cmd() -> None:
+    """Views + estimated earnings per streamer / category / platform."""
+    from rich.table import Table
+
+    from clipper.ops import load_tracker, report
+
+    rows = load_tracker()
+    if not rows:
+        raise ClipperError("tracker.csv is empty. Log posts with `clipper track add`.")
+    for key in ("streamer", "category", "platform"):
+        t = Table(key, "posts", "views", "est. $", title=f"By {key}")
+        for k, n, v, e in report(rows, key):
+            t.add_row(k, str(n), f"{v:,}", f"{e:.2f}")
+        console.print(t)
+    unsub = [r["url"] for r in rows if r["submitted"] != "y"]
+    if unsub:
+        console.print(f"[yellow]{len(unsub)} post(s) not submitted to a campaign yet: " + ", ".join(unsub))
+
+
+@app.command()
+def live(channel: str) -> None:
+    """[Phase 2, not built yet] Record live in 5-min segments + IRC chat, clip within minutes. See README."""
+    raise ClipperError(f"`clipper live {channel}` is planned (streamlink segments + anonymous IRC chat). "
+                       "For now run `clipper run <vod_url>` once the VOD is up.")
 
 
 def main() -> None:

@@ -24,6 +24,17 @@ class Weights(BaseModel):
     clips: float = 1.5
 
 
+class Campaign(BaseModel):
+    name: str
+    streamers: list[str]
+    platforms: list[str] = ["tiktok", "youtube", "instagram"]
+    required_tags: list[str] = []  # hashtags / @mentions the campaign requires in every caption
+    min_len: int = 15
+    max_len: int = 60
+    rate_per_1k: float = 1.0  # $ per 1,000 approved views
+    cap_per_clip: float | None = None  # max $ per clip
+
+
 DEFAULT_KEYWORDS: dict[str, float] = {
     "KEKW": 2, "LUL": 1.5, "OMEGALUL": 2, "LMAO": 1.5, "W": 1, "L": 1, "???": 1.5,
     "NO WAY": 2, "CLIP IT": 3, "CLIP": 2, "WHAT": 1, "HOLY": 1.5, "Pog": 1.5,
@@ -43,11 +54,15 @@ class Config(BaseModel):
     llm_model: str = "claude-haiku-5-5"
     render_workers: int = 3
     keywords: dict[str, float] = DEFAULT_KEYWORDS
+    campaigns: list[Campaign] = []
     data_dir: Path = Path("data")
     out_dir: Path = Path("out")
 
     def streamer(self, name: str | None) -> Streamer:
         return self.streamers.get(name or "") or self.streamers.get("default") or Streamer()
+
+    def campaign_for(self, streamer: str) -> Campaign | None:
+        return next((c for c in self.campaigns if streamer.lower() in (s.lower() for s in c.streamers)), None)
 
 
 def load_env(path: Path = Path(".env")) -> None:

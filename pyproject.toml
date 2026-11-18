@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=2.10.0",
     "chat-downloader>=0.2.8",
     "faster-whisper>=1.2.1",
+    "imageio-ffmpeg>=0.8.1",
     "numpy>=2.4.6",
     "pydantic>=2.14.3",
     "pyyaml>=6.0.3",

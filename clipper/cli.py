@@ -8,6 +8,7 @@ from clipper.config import load_config
 from clipper.ingest import ClipperError, console, ingest_local, ingest_url, parse_time, require_ffmpeg
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False, help="GTA 6 VOD -> 9:16 Shorts.")
+GENERIC_HOOK = "WAIT FOR IT..."
 
 
 @app.callback()
@@ -99,6 +100,7 @@ def _render(d: Path, top: int) -> tuple[Path, list[dict]]:
     from rich.progress import Progress
 
     from clipper.ingest import load_meta
+    from clipper.judge import transcribe
     from clipper.manifest import hms, slug, vod_link, write_manifest
     from clipper.render import render_clip
 
@@ -114,10 +116,17 @@ def _render(d: Path, top: int) -> tuple[Path, list[dict]]:
     for i, c in enumerate(cands, 1):
         f = out_dir / f"clip_{i:02d}_{slug(c.get('title') or c.get('category') or 'moment')}.mp4"
         rows.append({**c, "rank": i, "file": str(f), "vod_time": hms(c["vod_start"]), "vod_link": vod_link(meta, c["vod_start"])})
+    todo = [r for r in rows if not Path(r["file"]).exists()]
+    words = {}
+    with Progress(console=console) as prog:  # whisper is CPU-bound: transcribe sequentially, render in parallel
+        task = prog.add_task("Transcribing captions", total=len(todo))
+        for r in todo:
+            words[r["rank"]] = transcribe(d, r["start"], r["end"], cfg.whisper_model)
+            prog.advance(task)
     with Progress(console=console) as prog, ThreadPoolExecutor(cfg.render_workers) as pool:
         task = prog.add_task(f"Rendering {len(rows)} clips", total=len(rows))
-        futs = {pool.submit(render_clip, Path(meta["video"]), r["start"], r["end"], Path(r["file"]), facecam): r
-                for r in rows if not Path(r["file"]).exists()}
+        futs = {pool.submit(render_clip, Path(meta["video"]), r["start"], r["end"], Path(r["file"]), facecam,
+                            words[r["rank"]], r.get("hook") or GENERIC_HOOK): r for r in todo}
         prog.advance(task, len(rows) - len(futs))  # already rendered
         for fut in as_completed(futs):
             fut.result()
@@ -161,6 +170,24 @@ def run_all(
     _analyze(d, max(top * 2, top))  # over-fetch; later filters drop some
     out_dir, rows = _render(d, top)
     _summary(out_dir, rows)
+
+
+@app.command()
+def calibrate(job: str = typer.Argument(..., help="Job id (data/<job>)"),
+              at: str = typer.Option("0:05:00", help="VOD timestamp, e.g. 00:12:30")) -> None:
+    """Export one frame as PNG so you can read off the facecam box (x, y, w, h)."""
+    from clipper.ingest import job_dir, load_meta, parse_time, probe
+    from clipper.render import export_frame
+
+    d = job_dir(load_config(), job)
+    meta = load_meta(d)
+    video = Path(meta["video"])
+    w, h, dur = probe(video)
+    t = min(max(0, (parse_time(at) or 0) - meta["offset"]), dur - 1)
+    png = export_frame(video, t, d / f"calibrate_{int(t)}.png")
+    console.print(f"[green]Frame -> {png.resolve()}  (source {w}x{h})")
+    console.print("Open it, find the facecam rectangle in source pixels, then add to config.yaml:\n"
+                  f"streamers:\n  {meta['streamer']}:\n    facecam: {{ x: 1440, y: 0, w: 480, h: 270 }}")
 
 
 def main() -> None:

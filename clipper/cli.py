@@ -49,6 +49,7 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
     from clipper.judge import _client, generic_judgment, judge, transcribe
     from clipper.signals.audio import audio_signal, loudness_db
     from clipper.signals.chat import chat_signal
+    from clipper.signals.twitch_clips import twitch_clips_signal
 
     cfg = load_config()
     if use_llm:
@@ -59,7 +60,8 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
     msgs = load_chat(d)
     chat = chat_signal(msgs, n, cfg.keywords, cfg.chat_lag_seconds) if msgs else None
     audio = audio_signal(db)
-    score = fuse(chat, audio, None, cfg.weights, n)
+    clips = twitch_clips_signal(meta, n)
+    score = fuse(chat, audio, clips, cfg.weights, n)
     peaks = pick_peaks(score, top or cfg.max_candidates, cfg.min_gap_seconds, cfg.min_score)
     console.print(f"[cyan]{n}s analysed, {len(msgs)} chat msgs, {len(peaks)} peaks")
     min_len, max_len = 15, 60
@@ -71,6 +73,7 @@ def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[d
             "fused": round(float(score[p]), 3),
             "chat": round(float(chat[p]), 3) if chat is not None else 0.0,
             "audio": round(float(audio[p]), 3),
+            "clips": round(float(clips[p]), 3) if clips is not None else 0.0,
         })
     fmax = max((c["fused"] for c in cands), default=1.0) or 1.0
     streamer = meta["streamer"]

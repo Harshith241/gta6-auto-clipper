@@ -32,6 +32,13 @@ def test_audio_burst_detected(tmp_path) -> None:
     assert 119 <= int(np.argmax(sig)) <= 123
 
 
+def test_twitch_clip_bonus_lands_near_clip_payoff() -> None:
+    from clipper.signals.twitch_clips import clips_signal
+
+    sig = clips_signal([{"vod_offset": 1100, "duration": 30, "view_count": 500}], offset=1000, n=300)
+    assert abs(int(np.argmax(sig)) - 121) <= 1 and sig.max() > 5
+
+
 def test_fusion_respects_min_gap_and_top_n() -> None:
     s = np.zeros(1000)
     for p, h in [(100, 5), (130, 4), (400, 3), (700, 6), (900, 2)]:

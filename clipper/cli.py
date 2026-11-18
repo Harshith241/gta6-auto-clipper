@@ -75,11 +75,6 @@ def _analyze(d: Path, top: Optional[int] = None) -> list[dict]:
     return cands
 
 
-def _hms(t: float) -> str:
-    t = int(t)
-    return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}"
-
-
 @app.command()
 def analyze(job: str = typer.Argument(..., help="Job id printed by ingest (data/<job>)"),
             top: Optional[int] = typer.Option(None, help="Max candidates")) -> None:
@@ -87,13 +82,85 @@ def analyze(job: str = typer.Argument(..., help="Job id printed by ingest (data/
     from rich.table import Table
 
     from clipper.ingest import job_dir
+    from clipper.manifest import hms
 
     d = job_dir(load_config(), job)
     cands = _analyze(d, top)
     t = Table("#", "VOD time", "len", "fused", "chat", "audio", title=f"Candidates -> {d / 'candidates.json'}")
     for i, c in enumerate(cands, 1):
-        t.add_row(str(i), _hms(c["vod_start"]), f"{c['end'] - c['start']}s", str(c["fused"]), str(c["chat"]), str(c["audio"]))
+        t.add_row(str(i), hms(c["vod_start"]), f"{c['end'] - c['start']}s", str(c["fused"]), str(c["chat"]), str(c["audio"]))
     console.print(t)
+
+
+def _render(d: Path, top: int) -> tuple[Path, list[dict]]:
+    import json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from rich.progress import Progress
+
+    from clipper.ingest import load_meta
+    from clipper.manifest import hms, slug, vod_link, write_manifest
+    from clipper.render import render_clip
+
+    cfg = load_config()
+    meta = load_meta(d)
+    cpath = d / "candidates.json"
+    if not cpath.exists():
+        raise ClipperError(f"No candidates for {d.name}. Run `clipper analyze {d.name}` first.")
+    cands = json.loads(cpath.read_text())[:top]
+    out_dir = cfg.out_dir / meta["streamer"] / meta["job"]
+    facecam = cfg.streamer(meta["streamer"]).facecam
+    rows = []
+    for i, c in enumerate(cands, 1):
+        f = out_dir / f"clip_{i:02d}_{slug(c.get('title') or c.get('category') or 'moment')}.mp4"
+        rows.append({**c, "rank": i, "file": str(f), "vod_time": hms(c["vod_start"]), "vod_link": vod_link(meta, c["vod_start"])})
+    with Progress(console=console) as prog, ThreadPoolExecutor(cfg.render_workers) as pool:
+        task = prog.add_task(f"Rendering {len(rows)} clips", total=len(rows))
+        futs = {pool.submit(render_clip, Path(meta["video"]), r["start"], r["end"], Path(r["file"]), facecam): r
+                for r in rows if not Path(r["file"]).exists()}
+        prog.advance(task, len(rows) - len(futs))  # already rendered
+        for fut in as_completed(futs):
+            fut.result()
+            prog.advance(task)
+    write_manifest(out_dir, meta, rows)
+    return out_dir, rows
+
+
+def _summary(out_dir: Path, rows: list[dict]) -> None:
+    from rich.table import Table
+
+    t = Table("#", "VOD time", "score", "category", "title / hook", "file", title=f"{len(rows)} clips -> {out_dir}")
+    for r in rows:
+        t.add_row(str(r["rank"]), r["vod_time"], str(r.get("final", "")), r.get("category", ""),
+                  r.get("title") or r.get("hook") or "", Path(r["file"]).name)
+    console.print(t)
+    console.print(f"Manifest: {out_dir / 'manifest.json'}  CSV: {out_dir / 'clips.csv'}")
+
+
+@app.command()
+def render(job: str = typer.Argument(..., help="Job id (data/<job>)"), top: int = typer.Option(10, help="Render the best N")) -> None:
+    """Render top candidates to 9:16 MP4s + manifest."""
+    from clipper.ingest import job_dir
+
+    out_dir, rows = _render(job_dir(load_config(), job), top)
+    _summary(out_dir, rows)
+
+
+@app.command("run")
+def run_all(
+    url: Optional[str] = typer.Argument(None, help="Twitch/Kick VOD URL"),
+    video: Optional[Path] = typer.Option(None, help="Local video instead of a URL"),
+    chat: Optional[Path] = typer.Option(None, help="Chat JSON/JSONL export"),
+    streamer: Optional[str] = typer.Option(None),
+    start: Optional[str] = typer.Option(None, help="e.g. 1h"),
+    end: Optional[str] = typer.Option(None, help="e.g. 3h"),
+    top: int = typer.Option(10, help="Clips to render"),
+) -> None:
+    """ingest -> analyze -> render, all in one."""
+    d = _ingest(url, video, chat, streamer, start, end)
+    _analyze(d, max(top * 2, top))  # over-fetch; later filters drop some
+    out_dir, rows = _render(d, top)
+    _summary(out_dir, rows)
 
 
 def main() -> None:

@@ -39,6 +39,63 @@ def ingest(
     console.print(f"[bold green]Ingested -> {d}  (job id: {d.name})")
 
 
+def _analyze(d: Path, top: Optional[int] = None) -> list[dict]:
+    import json
+
+    import numpy as np
+
+    from clipper.fuse import clip_window, fuse, pick_peaks
+    from clipper.ingest import load_chat, load_meta
+    from clipper.signals.audio import audio_signal, loudness_db
+    from clipper.signals.chat import chat_signal
+
+    cfg = load_config()
+    meta = load_meta(d)
+    db = loudness_db(d / "audio.wav")
+    n = len(db)
+    msgs = load_chat(d)
+    chat = chat_signal(msgs, n, cfg.keywords, cfg.chat_lag_seconds) if msgs else None
+    audio = audio_signal(db)
+    score = fuse(chat, audio, None, cfg.weights, n)
+    peaks = pick_peaks(score, top or cfg.max_candidates, cfg.min_gap_seconds, cfg.min_score)
+    console.print(f"[cyan]{n}s analysed, {len(msgs)} chat msgs, {len(peaks)} peaks")
+    cands = []
+    for p in peaks:
+        s, e = clip_window(p, db, n)
+        cands.append({
+            "peak": p, "start": s, "end": e, "vod_start": meta["offset"] + s,
+            "fused": round(float(score[p]), 3),
+            "chat": round(float(chat[p]), 3) if chat is not None else 0.0,
+            "audio": round(float(audio[p]), 3),
+        })
+    fmax = max((c["fused"] for c in cands), default=1.0) or 1.0
+    for c in cands:
+        c["final"] = round(c["fused"] / fmax, 3)
+    (d / "candidates.json").write_text(json.dumps(cands, indent=2))
+    return cands
+
+
+def _hms(t: float) -> str:
+    t = int(t)
+    return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}"
+
+
+@app.command()
+def analyze(job: str = typer.Argument(..., help="Job id printed by ingest (data/<job>)"),
+            top: Optional[int] = typer.Option(None, help="Max candidates")) -> None:
+    """Signals + fusion -> data/<job>/candidates.json (no render)."""
+    from rich.table import Table
+
+    from clipper.ingest import job_dir
+
+    d = job_dir(load_config(), job)
+    cands = _analyze(d, top)
+    t = Table("#", "VOD time", "len", "fused", "chat", "audio", title=f"Candidates -> {d / 'candidates.json'}")
+    for i, c in enumerate(cands, 1):
+        t.add_row(str(i), _hms(c["vod_start"]), f"{c['end'] - c['start']}s", str(c["fused"]), str(c["chat"]), str(c["audio"]))
+    console.print(t)
+
+
 def main() -> None:
     try:
         app()

@@ -33,8 +33,13 @@ def clip_window(peak: int, db: np.ndarray, duration: int, pre: int = 25, post: i
         lo, hi = max(0, t - snap), min(len(db), t + snap + 1)
         return lo + int(np.argmin(db[lo:hi])) if hi > lo else t
 
-    start, end = quiet(max(0, peak - pre)), quiet(min(duration, peak + post))
+    return fit_length(quiet(max(0, peak - pre)), quiet(min(duration, peak + post)), duration, min_len, max_len)
+
+
+def fit_length(start: float, end: float, duration: float, min_len: float = 15, max_len: float = 60) -> tuple[int, int]:
+    """Force end-start into [min_len, max_len] and the window into [0, duration]."""
+    start, end = int(max(0, start)), int(end)
     end = min(max(end, start + min_len), start + max_len)
     if end > duration:  # near the end of the VOD: slide back
-        start, end = max(0, duration - (end - start)), duration
-    return start, end
+        start, end = max(0, int(duration - (end - start))), int(duration)
+    return start, int(end)

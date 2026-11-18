@@ -8,7 +8,6 @@ from clipper.config import load_config
 from clipper.ingest import ClipperError, console, ingest_local, ingest_url, parse_time, require_ffmpeg
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False, help="GTA 6 VOD -> 9:16 Shorts.")
-GENERIC_HOOK = "WAIT FOR IT..."
 
 
 @app.callback()
@@ -40,17 +39,20 @@ def ingest(
     console.print(f"[bold green]Ingested -> {d}  (job id: {d.name})")
 
 
-def _analyze(d: Path, top: Optional[int] = None) -> list[dict]:
+def _analyze(d: Path, top: Optional[int] = None, use_llm: bool = True) -> list[dict]:
     import json
 
-    import numpy as np
+    from rich.progress import Progress
 
-    from clipper.fuse import clip_window, fuse, pick_peaks
+    from clipper.fuse import clip_window, fit_length, fuse, pick_peaks
     from clipper.ingest import load_chat, load_meta
+    from clipper.judge import _client, generic_judgment, judge, transcribe
     from clipper.signals.audio import audio_signal, loudness_db
     from clipper.signals.chat import chat_signal
 
     cfg = load_config()
+    if use_llm:
+        _client()  # fail fast on a missing key
     meta = load_meta(d)
     db = loudness_db(d / "audio.wav")
     n = len(db)
@@ -60,36 +62,63 @@ def _analyze(d: Path, top: Optional[int] = None) -> list[dict]:
     score = fuse(chat, audio, None, cfg.weights, n)
     peaks = pick_peaks(score, top or cfg.max_candidates, cfg.min_gap_seconds, cfg.min_score)
     console.print(f"[cyan]{n}s analysed, {len(msgs)} chat msgs, {len(peaks)} peaks")
+    min_len, max_len = 15, 60
     cands = []
     for p in peaks:
-        s, e = clip_window(p, db, n)
+        s, e = clip_window(p, db, n, min_len=min_len, max_len=max_len)
         cands.append({
-            "peak": p, "start": s, "end": e, "vod_start": meta["offset"] + s,
+            "peak": p, "start": s, "end": e, "ts": max(0, s - 10), "te": min(n, e + 10),  # ts/te = transcribed range
             "fused": round(float(score[p]), 3),
             "chat": round(float(chat[p]), 3) if chat is not None else 0.0,
             "audio": round(float(audio[p]), 3),
         })
     fmax = max((c["fused"] for c in cands), default=1.0) or 1.0
-    for c in cands:
-        c["final"] = round(c["fused"] / fmax, 3)
-    (d / "candidates.json").write_text(json.dumps(cands, indent=2))
-    return cands
+    streamer = meta["streamer"]
+    kept = []
+    with Progress(console=console) as prog:
+        task = prog.add_task("Judging candidates" if use_llm else "Ranking", total=len(cands))
+        for c in cands:
+            prog.advance(task)
+            fused_norm = c["fused"] / fmax
+            if not use_llm:
+                kept.append({**c, **generic_judgment(c, streamer), "llm_score": None, "final": round(fused_norm, 3)})
+                continue
+            words = transcribe(d, c["ts"], c["te"], cfg.whisper_model)
+            in_win = [w for w in words if c["start"] <= w["s"] < c["end"]]
+            win_chat = [m for m in msgs if c["start"] <= m["t"] <= c["end"] + cfg.chat_lag_seconds]
+            j = judge(c, in_win, win_chat, streamer, cfg.llm_model)
+            if j is None or j.score < cfg.min_llm_score:
+                continue
+            s, e = fit_length(c["start"] + j.start, c["start"] + j.end, n, min_len, max_len)
+            s, e = max(s, c["ts"]), min(e, c["te"])  # stay inside the transcribed range
+            kept.append({**c, "start": s, "end": e, "llm_score": j.score, "category": j.category, "hook": j.hook,
+                         "title": j.title[:60], "caption": j.caption, "reason": j.reason,
+                         "final": round(0.6 * j.score / 10 + 0.4 * fused_norm, 3)})
+    kept.sort(key=lambda c: c["final"], reverse=True)
+    for c in kept:
+        c["vod_start"] = meta["offset"] + c["start"]
+    if use_llm:
+        console.print(f"[cyan]LLM kept {len(kept)}/{len(cands)} (min score {cfg.min_llm_score})")
+    (d / "candidates.json").write_text(json.dumps(kept, indent=2, ensure_ascii=False))
+    return kept
 
 
 @app.command()
 def analyze(job: str = typer.Argument(..., help="Job id printed by ingest (data/<job>)"),
-            top: Optional[int] = typer.Option(None, help="Max candidates")) -> None:
-    """Signals + fusion -> data/<job>/candidates.json (no render)."""
+            top: Optional[int] = typer.Option(None, help="Max candidates"),
+            no_llm: bool = typer.Option(False, "--no-llm", help="Skip the Claude judge (signal ranking only)")) -> None:
+    """Signals + fusion + judge -> data/<job>/candidates.json (no render)."""
     from rich.table import Table
 
     from clipper.ingest import job_dir
     from clipper.manifest import hms
 
     d = job_dir(load_config(), job)
-    cands = _analyze(d, top)
-    t = Table("#", "VOD time", "len", "fused", "chat", "audio", title=f"Candidates -> {d / 'candidates.json'}")
+    cands = _analyze(d, top, not no_llm)
+    t = Table("#", "VOD time", "len", "final", "llm", "fused", "category", "title", title=f"Candidates -> {d / 'candidates.json'}")
     for i, c in enumerate(cands, 1):
-        t.add_row(str(i), hms(c["vod_start"]), f"{c['end'] - c['start']}s", str(c["fused"]), str(c["chat"]), str(c["audio"]))
+        t.add_row(str(i), hms(c["vod_start"]), f"{c['end'] - c['start']}s", str(c["final"]), str(c.get("llm_score") or "-"),
+                  str(c["fused"]), c.get("category", ""), c.get("title", ""))
     console.print(t)
 
 
@@ -100,7 +129,7 @@ def _render(d: Path, top: int) -> tuple[Path, list[dict]]:
     from rich.progress import Progress
 
     from clipper.ingest import load_meta
-    from clipper.judge import transcribe
+    from clipper.judge import GENERIC_HOOK, transcribe
     from clipper.manifest import hms, slug, vod_link, write_manifest
     from clipper.render import render_clip
 
@@ -121,7 +150,7 @@ def _render(d: Path, top: int) -> tuple[Path, list[dict]]:
     with Progress(console=console) as prog:  # whisper is CPU-bound: transcribe sequentially, render in parallel
         task = prog.add_task("Transcribing captions", total=len(todo))
         for r in todo:
-            words[r["rank"]] = transcribe(d, r["start"], r["end"], cfg.whisper_model)
+            words[r["rank"]] = transcribe(d, r.get("ts", r["start"]), r.get("te", r["end"]), cfg.whisper_model)
             prog.advance(task)
     with Progress(console=console) as prog, ThreadPoolExecutor(cfg.render_workers) as pool:
         task = prog.add_task(f"Rendering {len(rows)} clips", total=len(rows))
@@ -164,10 +193,11 @@ def run_all(
     start: Optional[str] = typer.Option(None, help="e.g. 1h"),
     end: Optional[str] = typer.Option(None, help="e.g. 3h"),
     top: int = typer.Option(10, help="Clips to render"),
+    no_llm: bool = typer.Option(False, "--no-llm", help="Skip the Claude judge (signal ranking only)"),
 ) -> None:
     """ingest -> analyze -> render, all in one."""
     d = _ingest(url, video, chat, streamer, start, end)
-    _analyze(d, max(top * 2, top))  # over-fetch; later filters drop some
+    _analyze(d, None if not no_llm else top, not no_llm)  # LLM mode judges max_candidates, then keeps the best
     out_dir, rows = _render(d, top)
     _summary(out_dir, rows)
 

@@ -28,6 +28,15 @@ def ffmpeg_bin() -> str:
         return "ffmpeg"
 
 
+PREROLL = 8.0  # seconds of seek slack before the clip start; trimmed away exactly in the filter graph
+
+
+def has_audio(video: Path) -> bool:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                          "-of", "csv=p=0", str(video)], capture_output=True, text=True).stdout
+    return bool(out.strip())
+
+
 def has_ass(ffmpeg: str) -> bool:
     out = subprocess.run([ffmpeg, "-hide_banner", "-filters"], capture_output=True, text=True).stdout
     return bool(re.search(r"\sass\s", out))
@@ -97,7 +106,16 @@ def render_clip(video: Path, start: float, end: float, out: Path, facecam: Box |
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".tmp.mp4")
     ff = ffmpeg_bin()
-    graph = video_filter(facecam)
+    # Seek a few seconds early (fast, but imprecise on live-recorded MPEG-TS: newer ffmpeg can land video
+    # seconds after audio), then trim BOTH streams at the same timestamp so they start together at 0.
+    pre = min(PREROLL, start)
+    dur = end - start
+    audio = has_audio(Path(video))
+    graph = (f"[0:v]trim=start={pre:.3f}:duration={dur:.3f},setpts=PTS-STARTPTS[vin];"
+             + video_filter(facecam).replace("[0:v]", "[vin]", 1))
+    if audio:
+        graph += (f";[0:a]atrim=start={pre:.3f}:duration={dur:.3f},asetpts=PTS-STARTPTS,"
+                  "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]")
     if (words or hook) and has_ass(ff):
         cap_y, hook_y = (TOP_H, TOP_H + 260) if facecam else (1400, 470)
         ass = out.with_suffix(".ass")
@@ -106,10 +124,10 @@ def render_clip(video: Path, start: float, end: float, out: Path, facecam: Box |
         graph += f";[base]ass={ass.name}:fontsdir={FONTS_DIR}[v]"
     else:
         graph += ";[base]null[v]"
-    run([ff, "-y", "-v", "error", "-ss", f"{start:.2f}", "-i", str(Path(video).resolve()), "-t", f"{end - start:.2f}",
-         "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
+    run([ff, "-y", "-v", "error", "-fflags", "+genpts", "-ss", f"{start - pre:.3f}", "-i", str(Path(video).resolve()),
+         "-filter_complex", graph, "-map", "[v]", *(["-map", "[aout]"] if audio else []), "-t", f"{dur:.3f}",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-         "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
+         "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
          "-movflags", "+faststart", tmp.name], cwd=out.parent)
     tmp.rename(out)
     return out

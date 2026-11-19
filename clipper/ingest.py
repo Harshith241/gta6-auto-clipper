@@ -53,12 +53,30 @@ def probe(video: Path) -> tuple[int, int, float]:
     return j["streams"][0]["width"], j["streams"][0]["height"], float(j["format"]["duration"])
 
 
+def audio_lag(video: Path) -> float:
+    """Seconds between the file's start and its first audio sample (0 for normal files)."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=start_time:stream=codec_type,start_time",
+                          "-of", "json", str(video)], capture_output=True, text=True).stdout
+    try:
+        j = json.loads(out)
+        f0 = float(j["format"]["start_time"])
+        a0 = min(float(st["start_time"]) for st in j["streams"] if st.get("codec_type") == "audio")
+        return max(0.0, a0 - f0)
+    except (ValueError, KeyError, TypeError):
+        return 0.0
+
+
 def extract_audio(video: Path, wav: Path) -> None:
     if wav.exists():
         return
     tmp = wav.with_suffix(".tmp.wav")
     console.print("[cyan]Extracting 16 kHz mono audio...")
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(tmp)])
+    # Live recordings can start audio after video: pad that gap with silence so wav t=0 == video t=0
+    # (render seeks relative to the file start, and captions/peaks are timed from this wav).
+    lag = audio_lag(video)
+    af = ["-af", f"adelay={int(lag * 1000)}:all=1"] if lag > 0.02 else []
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", *af,
+         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(tmp)])
     tmp.rename(wav)
 
 
